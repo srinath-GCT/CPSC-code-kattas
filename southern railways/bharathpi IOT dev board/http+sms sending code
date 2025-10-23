@@ -1,0 +1,442 @@
+#include <Arduino.h>
+
+
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+//enter your mobile number
+#define SMS_TARGET "7845860047"
+
+#define SerialAT Serial1
+#define SerialMon Serial
+
+
+const char apn[] = "www";
+String api_url = "https://bharatrails.vercel.app/proins";
+
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+#include <Ticker.h>
+
+TinyGsm modem(SerialAT);
+StaticJsonDocument<200> payloadObj;
+
+#define UART_BAUD   115200
+#define PIN_TX      17
+#define PIN_RX      16
+#define PWR_PIN     26
+#define PIN_DTR     25
+#define MAINTENANCE_SWITCH_PIN 4
+#define RELAY_PIN 2
+#define BACKUP_BATTERY_SENSOR_PIN 0
+#define PANEL_SENSOR_PIN 2
+#define MAINS_VOLTAGE_SENSOR_PIN 4
+#define LED_PIN 2
+
+void modemPowerOn();
+void checkMaintenanceMode();
+void heartbeat();
+void panelvoltage24();
+void backupvoltage24();
+void voltage110();
+void sendPeriodicDataToServer();
+void sendHttpData();
+
+const unsigned long DEBOUNCE_DELAY = 2000;
+bool isInMaintenanceMode = false;
+bool wasInMaintenanceMode = false;
+const String TRAIN_NUMBER = "12674";
+const String COACH_NUMBER = "B4-203813";
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 60000;
+float powerpanelvoltage;
+float batteryvoltage;
+bool wasRelayTriggered = false;
+const float REFERENCE_VOLTAGE = 3.3;
+const float VOLTAGE_SCALE_FACTOR = 8.1818;
+bool isMainsVoltagePresent = true;
+bool wasMainsVoltagePresent = true;
+unsigned long lastPeriodicSendTime = 0;
+const unsigned long PERIODIC_SEND_INTERVAL_MS =300000; // 5 minutes
+
+
+void setup() {
+  SerialMon.begin(115200);
+  pinMode(MAINTENANCE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  delay(5000);
+
+  modemPowerOn();
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+  SerialMon.println("Initializing Modem...");
+
+  if (!modem.init()) {
+    SerialMon.println("Failed to initialize modem");
+    return;
+  }
+
+  SerialMon.println("Connecting to network...");
+  modem.setNetworkMode(2);
+
+  bool isConnected = false;
+  int tryCount = 60;
+  while (tryCount--) {
+    isConnected = modem.waitForNetwork();
+    if (isConnected) {
+      break;
+    }
+    delay(1000);
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+
+  if (!isConnected) {
+    SerialMon.println("Failed to connect to network");
+    return;
+  }
+
+  digitalWrite(LED_PIN, HIGH);
+  SerialMon.println("Network connected successfully!");
+
+  delay(1000);
+
+  SerialMon.println("Setup completed successfully");
+}
+
+void loop() {
+  delay(6000);
+
+  int signalQuality;
+  Serial.println("+++++++++++++++++++Start of main loop");
+
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop first check: ");
+  Serial.println(signalQuality);
+
+  checkMaintenanceMode();
+  delay(2000);
+
+  if (isInMaintenanceMode) {
+    Serial.println("maintanance mode is not active");
+    panelvoltage24();
+    delay(5000);
+    backupvoltage24();
+    delay(5000);
+    voltage110();
+    delay(5000);
+  }
+
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop second check: ");
+  Serial.println(signalQuality);
+
+  heartbeat();
+
+  // Periodic HTTP POST every 5 minutes
+  if (millis() - lastPeriodicSendTime >= PERIODIC_SEND_INTERVAL_MS) {
+    sendPeriodicDataToServer();
+    lastPeriodicSendTime = millis();
+  }
+
+  Serial.println("End of main loop++++++++++++++++++");
+}
+
+void modemPowerOn() {
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1000);
+  digitalWrite(PWR_PIN, HIGH);
+}
+
+
+void readHTTPResponse() {
+  modem.sendAT("+HTTPSTATUS?");
+  String response = "";
+  modem.waitResponse(5000L, response);
+
+  modem.sendAT("+HTTPREAD");
+  response = "";
+  modem.waitResponse(5000L, response);
+}
+
+void sendHttpData() {
+  String payload;
+  serializeJson(payloadObj, payload);
+
+  Serial.println("Making HTTP POST request...");
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("HTTP init failed");
+    return;
+  }
+
+  modem.sendAT("+HTTPPARA=\"URL\"," + api_url);
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("URL setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Content type setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  modem.sendAT("+HTTPDATA=" + String(payload.length()) + ",10000");
+  while (modem.waitResponse(1000UL, "DOWNLOAD") != 1) {
+    Serial.print(".");
+  }
+
+  modem.streamWrite(payload.c_str());
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Data sending failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  modem.sendAT("+HTTPACTION=1");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("POST action failed");
+  } else {
+    Serial.println("POST request sent successfully");
+    Serial.print("Payload: ");
+    Serial.println(payload);
+
+    delay(3000);
+    readHTTPResponse();
+  }
+
+  delay(2000);
+  modem.sendAT("+HTTPTERM");
+  modem.waitResponse(5000L);
+
+  Serial.println("HTTP post data sent successfully");
+}
+
+// --- Maintenance mode trigger ---
+void checkMaintenanceMode() {
+  static int lastStableState = HIGH;
+  static unsigned long lastDebounceTime = 0;
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+
+  if (currentState != lastStableState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    if (currentState != isInMaintenanceMode) {
+      isInMaintenanceMode = (currentState == LOW);
+
+      payloadObj["coachid"] = COACH_NUMBER;
+      payloadObj["pribat"] = int((analogRead(PANEL_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+      payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+      payloadObj["pripow"] = isMainsVoltagePresent;
+      payloadObj["maintainance"] = isInMaintenanceMode;
+      payloadObj["lat"] = "8.99";
+      payloadObj["lng"] = "28.88";
+      payloadObj["sig"] = modem.getSignalQuality();
+
+      if (isInMaintenanceMode) {
+        modem.sendSMS(SMS_TARGET, "Maintenance Mode ACTIVATED - Alerts disabled");
+        Serial.println("Maintenance Mode ACTIVATED");
+        delay(5000);
+        sendHttpData();
+        delay(5000);
+        isInMaintenanceMode = false;
+      } else {
+        modem.sendSMS(SMS_TARGET, "Maintenance Mode DEACTIVATED - Alerts enabled");
+        Serial.println("Maintenance Mode DEACTIVATED");
+        delay(5000);
+        sendHttpData();
+        delay(5000);
+        isInMaintenanceMode = true;
+      }
+    }
+  }
+
+  lastStableState = currentState;
+}
+
+// --- panelvoltage24 triggers ---
+void panelvoltage24() {
+  int vesdaRawValue = analogRead(PANEL_SENSOR_PIN);
+  int currentVoltage = int((vesdaRawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+
+  static int prevVoltage = 27;
+
+  // Normal trigger
+  if (currentVoltage != prevVoltage && currentVoltage <= 26 && currentVoltage >= 21) {
+    modem.sendSMS(SMS_TARGET, "PP bat low (" + String(prevVoltage) + "V)");
+    prevVoltage = currentVoltage;
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = currentVoltage;
+    payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+
+  // Relay to low
+  if (currentVoltage <= 20 && prevVoltage > 20) {
+    digitalWrite(RELAY_PIN, LOW);
+    modem.sendSMS(SMS_TARGET, "PP Bat Switched to BB bat at 20V");
+    prevVoltage = currentVoltage;
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = currentVoltage;
+    payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+  // Relay to high
+  else if (currentVoltage > 21 && digitalRead(RELAY_PIN) == LOW) {
+    digitalWrite(RELAY_PIN, HIGH);
+    modem.sendSMS(SMS_TARGET, "BB Bat Switched to PP bat at 20V");
+    prevVoltage = currentVoltage;
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = currentVoltage;
+    payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+}
+
+// --- backupvoltage24 triggers ---
+void backupvoltage24() {
+  int rawValue = 3000;//analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  int currentVoltage = int((rawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+
+  static int prevVoltage = 27;
+
+  // Normal trigger
+  if (currentVoltage != prevVoltage && currentVoltage <= 26 && currentVoltage >= 21) {
+    modem.sendSMS(SMS_TARGET, "Backup bat low (" + String(prevVoltage) + "V)");
+    prevVoltage = currentVoltage;
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = int((analogRead(PANEL_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["backbat"] = currentVoltage;
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+
+  // Critical trigger
+  if (currentVoltage <= 20 && prevVoltage > 20) {
+    modem.sendSMS(SMS_TARGET, "Backup bat low (20V)");
+    prevVoltage = currentVoltage;
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = int((analogRead(PANEL_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["backbat"] = currentVoltage;
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+}
+
+// --- voltage110 absent trigger ---
+void voltage110() {
+  int mainsVoltageDigitalValue = digitalRead(MAINS_VOLTAGE_SENSOR_PIN);
+
+  isMainsVoltagePresent = (mainsVoltageDigitalValue == LOW);
+
+  if (!isMainsVoltagePresent && wasMainsVoltagePresent) {
+    Serial.print(" | Mains Status: "); Serial.println(isMainsVoltagePresent ? "Present" : "Absent");
+    String message = "110V Absent, Check Mains";
+    modem.sendSMS(SMS_TARGET, message);
+
+    payloadObj["coachid"] = COACH_NUMBER;
+    payloadObj["pribat"] = int((analogRead(PANEL_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+    payloadObj["pripow"] = isMainsVoltagePresent;
+    payloadObj["maintainance"] = !isInMaintenanceMode;
+    payloadObj["lat"] = "8.99";
+    payloadObj["lng"] = "28.88";
+    payloadObj["sig"] = modem.getSignalQuality();
+    delay(5000);
+    sendHttpData();
+    delay(5000);
+  }
+  wasMainsVoltagePresent = isMainsVoltagePresent;
+}
+
+
+
+void heartbeat(){
+  unsigned long currentMillis = millis();
+  Serial.println("calling heart beat");
+  String Message;
+   int vesdaRawValue = analogRead(PANEL_SENSOR_PIN); // 700 test value
+   float primaryVoltage = (vesdaRawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+   int rawValue = analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  float currentVoltage = (rawValue / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR ;
+
+    int signalQuality = modem.getSignalQuality();
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+  
+
+  if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+    Message += " T.No.:" + String(TRAIN_NUMBER)+"\n";
+    Message +=  "C.NO.: " + String(COACH_NUMBER)+"\n";
+    Message += "MAIN: " + String(isMainsVoltagePresent ? "ON\n" : "OFF\n");
+    Message += "PB:" + String(primaryVoltage,2) +"V\n";
+    Message += "BB:" + String(currentVoltage,2) +"V\n";
+    Message += "SS:" + String(signalQuality) +"\n";
+
+    Serial.println("heart beat should be sent out"); 
+   modem.sendSMS( SMS_TARGET , Message);
+
+    //sendSMS(phoneNumber, Message, "hearbeat");
+    lastHeartbeatTime = currentMillis;
+  }
+}
+
+// --- Periodic send every 5 minutes ---
+void sendPeriodicDataToServer() {
+  payloadObj["coachid"] = COACH_NUMBER;
+  payloadObj["pribat"] = int((analogRead(PANEL_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+  payloadObj["backbat"] = int((analogRead(BACKUP_BATTERY_SENSOR_PIN) / 4095.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR);
+  payloadObj["pripow"] = isMainsVoltagePresent;
+  payloadObj["maintainance"] = !isInMaintenanceMode;
+  payloadObj["lat"] = "8.99";
+  payloadObj["lng"] = "28.88";
+  payloadObj["sig"] = modem.getSignalQuality();
+  delay(5000);
+  sendHttpData();
+  delay(5000);
+}
