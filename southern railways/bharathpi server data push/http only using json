@@ -1,0 +1,260 @@
+#include <Arduino.h>
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+#define SerialAT Serial1
+#define SerialMon Serial
+const char apn[] = "www";
+String api_url = "https://bharatrails.vercel.app/proins";
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+#include <Ticker.h>
+#include <SoftwareSerial.h>
+
+TinyGsm modem(SerialAT);
+StaticJsonDocument<200> payloadObj;
+#define UART_BAUD   115200
+#define PIN_TX      17
+#define PIN_RX      16
+#define PWR_PIN     26
+#define PIN_DTR     25
+#define MAINTENANCE_SWITCH_PIN 5
+#define RELAY_PIN 12
+#define BACKUP_BATTERY_SENSOR_PIN 2
+#define PANEL_SENSOR_PIN 4
+#define MAINS_VOLTAGE_SENSOR_PIN 13
+#define LED_PIN 14
+int GPSRXPin = 33;
+int GPSTXPin = 32;
+SoftwareSerial gpsSerial(GPSRXPin,GPSTXPin);
+
+
+void modemPowerOn();
+void checkMaintenanceMode();
+void sendHttpData();
+bool isInMaintenanceMode = true;
+const String TRAIN_NUMBER = "12674";
+const String COACH_NUMBER = "B4-203813";
+bool isMainsVoltagePresent = true;
+unsigned long lastHttpSendTime = 0;   // global variable
+const unsigned long sendInterval = 10000; // 5 minutes in ms
+
+String nmea = "";
+double currentLat = 0.0;
+double currentLon = 0.0;
+
+void setup() {
+  SerialMon.begin(9600);
+  pinMode(MAINTENANCE_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(RELAY_PIN,OUTPUT);
+  pinMode(MAINS_VOLTAGE_SENSOR_PIN,INPUT);
+  analogWrite(RELAY_PIN,0);       
+  delay(5000);
+  modemPowerOn();
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+  SerialMon.println("Initializing Modem...");
+  if (!modem.init()) {
+    SerialMon.println("Failed to initialize modem");
+    return;
+  }
+   SerialMon.println("Connecting to network...");
+  modem.setNetworkMode(2);
+   bool isConnected = false;
+  int tryCount = 60;
+  while (tryCount--) {
+    isConnected = modem.waitForNetwork();
+    if (isConnected) {
+      break;
+    }
+    delay(1000);
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+  }
+   if (!isConnected) {
+    SerialMon.println("Failed to connect to network");
+    return;
+  }
+  digitalWrite(LED_PIN, HIGH);
+  SerialMon.println("Network connected successfully!");
+   delay(1000);
+     SerialMon.println("Setup completed successfully");
+}
+void loop() {
+   int signalQuality;
+  Serial.println("Start of main loop");
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop first check: ");
+  Serial.println(signalQuality);
+
+  while (gpsSerial.available()) {
+    char c = gpsSerial.read();
+    if (c == '\n') {
+      // we finished one NMEA sentence
+      if (nmea.startsWith("$GPRMC")) {
+        parseGPRMC(nmea);
+        break;
+      }
+      nmea = "";
+    } else if (c != '\r') {
+      nmea += c;
+    }
+  }
+
+
+  checkMaintenanceMode();
+   unsigned long currentMillis = millis();
+  if (currentMillis - lastHttpSendTime >= sendInterval) {
+    //sendHttpData();
+    lastHttpSendTime = currentMillis;
+  }
+  delay(5000);
+}
+void modemPowerOn() {
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1000);
+  digitalWrite(PWR_PIN, HIGH);
+}
+void readHTTPResponse() {
+  modem.sendAT("+HTTPSTATUS?");
+  String response = "";
+  modem.waitResponse(5000L, response);
+   modem.sendAT("+HTTPREAD");
+  response = "";
+  modem.waitResponse(5000L, response);
+}
+  void sendHttpData() {
+  String payload;
+  serializeJson(payloadObj, payload);
+  Serial.println("Making HTTP POST request...");
+   modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("HTTP init failed");
+    return;
+  }
+   modem.sendAT("+HTTPPARA=\"URL\"," + api_url);
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("URL setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+   modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Content type setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+   modem.sendAT("+HTTPDATA=" + String(payload.length()) + ",10000");
+  while (modem.waitResponse(1000UL, "DOWNLOAD") != 1) {
+    Serial.print(".");
+  }
+  modem.streamWrite(payload.c_str());
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Data sending failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+   modem.sendAT("+HTTPACTION=1");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("POST action failed");
+  } else {
+    Serial.println("POST request sent successfully");
+    Serial.print("Payload: ");
+    Serial.println(payload);
+    delay(3000);
+    readHTTPResponse();
+  }
+   delay(2000);
+  modem.sendAT("+HTTPTERM");
+  modem.waitResponse(5000L);
+ Serial.println("HTTP post data sent successfully");
+}
+void checkMaintenanceMode() {
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+  Serial.println("Maintenance mode call");
+ int  sensorValue =analogRead(PANEL_SENSOR_PIN);
+  int Pbattery = 0;
+ int  sensorValue2 =analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  int Bbattery = 0;
+if (sensorValue >= 2900) 
+     Pbattery = 24;
+  else if (sensorValue >= 2700 && sensorValue < 2800) 
+     Pbattery = 23;
+  else if (sensorValue >= 2600 && sensorValue < 2700) 
+     Pbattery = 22;
+  else if (sensorValue >= 2510 && sensorValue < 2600) 
+    Pbattery = 21;
+  else if (sensorValue >= 2540 && sensorValue < 2510) 
+     Pbattery = 20;
+  else if (sensorValue >= 2300 && sensorValue < 2400) 
+     Pbattery = 19;
+  else if (sensorValue >= 2200 && sensorValue < 2300) 
+   Pbattery = 18;
+   
+  if (sensorValue2 >= 2900) 
+     Bbattery = 24;
+  else if (sensorValue2 >= 2700 && sensorValue2 < 2800) 
+     Bbattery = 23;
+  else if (sensorValue2 >= 2600 && sensorValue2 < 2700)
+     Bbattery = 22;
+  else if (sensorValue2 >= 2510 && sensorValue2 < 2600) 
+    Bbattery = 21;
+  else if (sensorValue2 >= 2400 && sensorValue2 <= 2510) 
+     Bbattery = 20;
+  else if (sensorValue2 >= 2300 && sensorValue2 <= 2400) 
+     Bbattery = 19;
+  else if (sensorValue2 >= 2200 && sensorValue2 <= 2300)
+   Bbattery = 18;
+
+Serial.println("batter : ");
+Serial.println(Bbattery);
+  
+  if(analogRead(MAINS_VOLTAGE_SENSOR_PIN)<80)
+    isMainsVoltagePresent=true;
+  else
+    isMainsVoltagePresent=false;
+      payloadObj["coachid"] = COACH_NUMBER;
+      payloadObj["pribat"] = Pbattery;
+      payloadObj["backbat"] = Bbattery;
+      payloadObj["pripow"] = isMainsVoltagePresent;
+      payloadObj["maintainance"] = currentState;
+      payloadObj["lat"] = "currentLat";
+      payloadObj["lng"] = "currentLon";
+      payloadObj["sig"] = modem.getSignalQuality();
+      if(Pbattery<20)
+          analogWrite(RELAY_PIN, 200);
+      else
+        analogWrite(RELAY_PIN,0);
+
+}
+
+void parseGPRMC(String s) {
+  String f[12];
+  int idx = 0;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char ch = s.charAt(i);
+    if (ch == ',') {
+      idx++;
+      if (idx >= 12) break;
+    } else {
+      f[idx] += ch;
+    }
+  }
+
+  if (f[2] != "A") return; // only update if fix is active
+  if (f[3].length() < 4 || f[5].length() < 5) return;
+
+  currentLat = nmeaToDecimalDegrees(f[3], true);
+  if (f[4] == "S") currentLat = -currentLat;
+
+  currentLon = nmeaToDecimalDegrees(f[5], false);
+  if (f[6] == "W") currentLon = -currentLon;
+}
+
+double nmeaToDecimalDegrees(String field, bool isLatitude) {
+  int degDigits = isLatitude ? 2 : 3;
+  double degrees = field.substring(0, degDigits).toDouble();
+  double minutes = field.substring(degDigits).toDouble();
+  return degrees + (minutes / 60.0);
+}
