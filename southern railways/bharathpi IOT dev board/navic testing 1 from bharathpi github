@@ -1,0 +1,143 @@
+#define TINY_GSM_MODEM_SIM7600 //TINY_GSM_MODEM compatible for 7672 as well
+#define TINY_GSM_RX_BUFFER 1024
+
+#include <TinyGsmClient.h>
+
+// GSM module connections - Using Hardware Serial1
+#define GSM_TX 17  // ESP32 TX1 -> GSM RX
+#define GSM_RX 16  // ESP32 RX1 -> GSM TX
+#define PWR_PIN 26
+
+// NavIC GPS connections - Using Hardware Serial2
+#define GPS_TX 33  // ESP32 TX2 -> GPS RX
+#define GPS_RX 32  // ESP32 RX2 -> GPS TX
+
+// Phone number to send SMS to
+#define SMS_TARGET "7845860047"  // Replace with your phone number
+
+// Use HardwareSerial for GSM
+HardwareSerial gsmSerial(1);  // Serial1
+TinyGsm modem(gsmSerial);
+
+// Use HardwareSerial for GPS
+HardwareSerial gpsSerial(2);  // Serial2
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Initialize GSM serial port
+  gsmSerial.begin(115200, SERIAL_8N1, GSM_RX, GSM_TX);
+  
+  // Initialize GPS serial port
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);  // Standard baud rate for Skytraq GPS
+  
+  Serial.println("Initializing system...");
+  
+  // Power on GSM module
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1000);
+  digitalWrite(PWR_PIN, HIGH);
+  delay(2000);
+  
+  // Initialize GSM modem
+  if (!modem.init()) {
+    Serial.println("Failed to initialize modem");
+    return;
+  }
+  
+  // Wait for network connection
+  Serial.println("Waiting for network...");
+  if (!modem.waitForNetwork()) {
+    Serial.println("Network connection failed");
+    return;
+  }
+  Serial.println("Network connected");
+  
+  // Wait for GSM registration
+  if (!modem.isGprsConnected()) {
+    Serial.println("GPRS not connected");
+  }
+  
+  // Send initial SMS
+  modem.sendSMS(SMS_TARGET, "GPS Tracker initialized. Waiting for location...");
+}
+
+void loop() {
+  // Read GPS data
+  if (gpsSerial.available()) {
+    String gpsData = gpsSerial.readStringUntil('\n');
+    
+    // Check if it's a GGA sentence (contains location data)
+    if (gpsData.startsWith("$GPGGA")) {
+      // Parse the GGA sentence
+      String location = parseGGA(gpsData);
+      
+      if (location != "") {
+        // Send location via SMS
+        String message = "Location: " + location;
+        modem.sendSMS(SMS_TARGET, message);
+        Serial.println("SMS sent: " + message);
+        
+        // Wait for 5 minutes before sending next location
+        delay(3000);
+      }
+    }
+  }
+}
+
+String parseGGA(String ggaSentence) {
+  // Split the GGA sentence by commas
+  int commas[15];
+  int commaCount = 0;
+  
+  for (int i = 0; i < ggaSentence.length(); i++) {
+    if (ggaSentence[i] == ',') {
+      commas[commaCount] = i;
+      commaCount++;
+    }
+  }
+  
+  // Check if we have enough fields
+  if (commaCount < 9) return "";
+  
+  // Extract latitude
+  String latStr = ggaSentence.substring(commas[1] + 1, commas[2]);
+  String latDir = ggaSentence.substring(commas[2] + 1, commas[3]);
+  
+  // Extract longitude
+  String lonStr = ggaSentence.substring(commas[3] + 1, commas[4]);
+  String lonDir = ggaSentence.substring(commas[4] + 1, commas[5]);
+  
+  // Extract fix quality
+  String fixQuality = ggaSentence.substring(commas[5] + 1, commas[6]);
+  
+  // Only return data if we have a valid fix
+  if (fixQuality.toInt() == 0) return "";
+  
+  // Convert to decimal degrees
+  String latitude = convertToDecimalDegrees(latStr, latDir);
+  String longitude = convertToDecimalDegrees(lonStr, lonDir);
+  
+  return latitude + ", " + longitude;
+}
+
+String convertToDecimalDegrees(String coord, String direction) {
+  // Format: DDMM.MMMMM or DDDMM.MMMMM
+  int dotIndex = coord.indexOf('.');
+  if (dotIndex < 2) return "";
+  
+  String degreesStr = coord.substring(0, dotIndex - 2);
+  String minutesStr = coord.substring(dotIndex - 2);
+  
+  float degrees = degreesStr.toFloat();
+  float minutes = minutesStr.toFloat();
+  float decimalDegrees = degrees + (minutes / 60.0);
+  
+  if (direction == "S" || direction == "W") {
+    decimalDegrees = -decimalDegrees;
+  }
+  
+  return String(decimalDegrees, 6);
+}
