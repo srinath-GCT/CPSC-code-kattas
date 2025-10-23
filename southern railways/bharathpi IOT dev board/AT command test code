@@ -1,0 +1,71 @@
+// ============================================================================
+//          BHARATH PI GSM AT COMMAND PASSTHROUGH PROGRAM
+// ============================================================================
+// This program passes AT commands between Serial Monitor and GSM module
+// Commands from Serial Monitor -> GSM Module
+// Responses from GSM Module -> Serial Monitor
+// ============================================================================
+
+#define GSM_TX 17  // ESP32 TX to GSM RX
+#define GSM_RX 16  // ESP32 RX to GSM TX
+
+HardwareSerial gsmSerial(2);
+
+void setup() {
+  Serial.begin(115200);
+  gsmSerial.begin(115200, SERIAL_8N1, GSM_RX, GSM_TX);
+  
+  delay(2000);
+  
+  Serial.println("===========================================");
+  Serial.println("   BHARATH PI GSM AT COMMAND INTERFACE    ");
+  Serial.println("===========================================");
+  Serial.println("GSM Module connected on UART2 (Pins 16/17)");
+  Serial.println("Type AT commands to communicate with GSM:");
+  Serial.println("  AT        -> Test communication");
+  Serial.println("  ATI       -> Module info");
+  Serial.println("  AT+CPIN?  -> SIM status");
+  Serial.println("  AT+CSQ    -> Signal quality");
+  Serial.println("===========================================");
+  Serial.println();
+  
+  // Test initial communication
+  Serial.println("Testing GSM module communication...");
+  gsmSerial.println("AT");
+  delay(1000);
+  
+  if (gsmSerial.available()) {
+    Serial.println("GSM module is responding!");
+  } else {
+    Serial.println("No response from GSM module");
+  }
+  
+  Serial.print("AT> ");
+}
+
+void loop() {
+  // Forward commands from Serial Monitor to GSM module
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    Serial.println(command); // Echo command
+    gsmSerial.println(command); // Send to GSM
+    
+    // Wait for response
+    delay(500);
+    
+    // Print response from GSM module
+    while (gsmSerial.available()) {
+      Serial.write(gsmSerial.read());
+    }
+    
+    Serial.println(); // New line
+    Serial.print("AT> ");
+  }
+  
+  // Forward any unsolicited messages from GSM to Serial Monitor
+  if (gsmSerial.available()) {
+    Serial.write(gsmSerial.read());
+  }
+}
