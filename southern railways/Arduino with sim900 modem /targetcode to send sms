@@ -1,0 +1,438 @@
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+
+// Select your modem:
+#define TINY_GSM_MODEM_SIM900
+
+#include <TinyGsmClient.h>
+
+// SIM900 module pins
+#define SIM900_RX_PIN 7
+#define SIM900_TX_PIN 8
+#define SIM900_PWR_PIN 9   // Connect to SIM900 "PWR" or "KEY" pin 
+#define RELAY_PIN 2
+#define BACKUP_BATTERY_SENSOR_PIN A1
+#define PANEL_SENSOR_PIN A0
+#define MAINS_VOLTAGE_SENSOR_PIN A2
+#define MAINTENANCE_SWITCH_PIN 4
+
+// Maintenance mode status
+float powerpanelvoltage;
+float batteryvoltage;
+unsigned long lastHeartbeatTime = 0;
+const unsigned long HEARTBEAT_INTERVAL_MS = 3600000; // 1 minute in milliseconds (adjust as needed)
+bool networkoutage = false;
+
+// Create a SoftwareSerial object for SIM900 communication
+SoftwareSerial sim900Serial(SIM900_RX_PIN, SIM900_TX_PIN);
+
+// Initialize the GSM client
+TinyGsm modem(sim900Serial);
+
+// Configuration
+String phoneNumber = "+917845860047";
+String phoneNumber1 = "+919003956401";// Replace with target phone number
+
+// Function declarations
+void initializeGSM();
+bool sendSMS(const String number, const String text, const String text1);
+void powerOnSIM900();
+bool testATCommands();
+void check110voltage();
+void voltageStatus(float,float);
+void heartbeat();
+bool checkNetwork();
+void panelvoltage24();
+void backupvoltage24();
+void voltage110();
+void clearbuffer();
+void systemstart();
+void clearSerialBuffer();
+void checkMaintenanceMode();
+
+// Maintenance mode constants and variables from Code 2
+
+const unsigned long DEBOUNCE_DELAY = 2000;
+bool isInMaintenanceMode = false;  // Changed to false initially
+bool wasInMaintenanceMode = false;
+const String TRAIN_NUMBER = "Train No: 12674";
+const String COACH_NUMBER = "Coach No: B5-203813";
+// SMS Alerts at these EXACT voltages
+const float ALERT_VOLTAGES[] = {22.0};  
+float lastVoltage = 21.0;  // Initialize above highest threshold
+bool wasAlertSent[1] = {false}; 
+
+// Relay switching at 18V
+const float RELAY_TRIGGER_VOLTAGE = 18.0;
+bool wasRelayTriggered = false;   // Track relay state
+// Backup Battery Settings (identical to panel voltage logic)
+const float BACKUP_ALERT_VOLTAGES[] = {22.0, 21.0, 20.0, 19.0}; // Exact voltages for SMS
+const float BACKUP_CRITICAL_VOLTAGE = 18.0;                     // Critical threshold
+float lastBackupVoltage = 24.0;                                 // Track previous reading
+bool backupAlertsSent[4] = {false};                             // For exact voltage alerts
+bool wasCriticalSent = false;                                   // For 18V alert
+const float CALIBRATION_FACTOR = 1.0;
+const float REFERENCE_VOLTAGE = 5.0;
+const float VOLTAGE_SCALE_FACTOR = 5.0;
+bool isMainsVoltagePresent = true;
+bool wasMainsVoltagePresent = true;
+
+
+
+
+void setup() {
+  // Initialize serial communication for debugging
+  Serial.begin(9600);
+  delay(2000);
+  sim900Serial.begin(9600);
+  Serial.println("$$$$$$$$$$$$$$$$$$$$Start of Initialization");
+  delay(6000);
+
+  // Initialize maintenance switch pin
+  pinMode(MAINTENANCE_SWITCH_PIN, INPUT_PULLUP);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); 
+
+  Serial.println("SIM900 TinyGSM Communication Test with Power-On Reset");
+  powerOnSIM900();
+  
+   //clearSerialBuffer();
+   //clearbuffer();
+
+  Serial.println("Starting SIM900 SMS System...");
+  delay (12000);
+
+   //if(!testATCommands()) {
+  // Serial.println("Aborting GSM initialization.");
+   //  return;
+ // } else {
+ //       Serial.println("GSM initialization started.");
+ // }
+
+ Serial.print("Modem Info: ");
+  Serial.println(modem.getModemInfo());
+  
+  // Wait for network registration
+ Serial.println("Waiting for network...");
+  if (!modem.waitForNetwork()) {
+    Serial.println("Failed to connect to network");
+    return;
+  }
+  
+  if (modem.isNetworkConnected()) {
+    Serial.println("Network connected");
+  }
+  
+  // Check signal quality
+  int signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality: ");
+  Serial.println(signalQuality);
+
+   
+   //clearbuffer();
+
+
+   //modem.sendSMS(phoneNumber, "opentest");
+
+  systemstart();
+
+   clearbuffer();
+
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality second check: ");
+  Serial.println(signalQuality);
+
+  Serial.println("$$$$$$$$$$$$$$$$$$$$End of Initialization");
+}
+
+void loop() {
+  delay(6000);  // Wait 6 sec
+
+  int signalQuality;
+  Serial.println("+++++++++++++++++++Start of main loop");
+    
+  
+  clearbuffer();
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop first check: ");
+  Serial.println(signalQuality);
+
+  checkMaintenanceMode(); // First check maintenance mode - with debounce
+  delay(2000);
+
+  if (isInMaintenanceMode){
+  Serial.println("maintanance mode is not active");
+  panelvoltage24();
+  delay(2000);
+  backupvoltage24();
+  delay(2000);
+  voltage110();
+  delay(2000);
+  }
+  
+  signalQuality = modem.getSignalQuality();
+  Serial.print("Signal quality main loop second check: ");
+  Serial.println(signalQuality);
+  heartbeat(); // First message then 1min repeat
+
+  Serial.println("End of main loop++++++++++++++++++");
+}
+
+void powerOnSIM900() {
+  // SIM900 expects PWR pin to be pulled LOW for ~1 second to power on
+ Serial.println("Toggling SIM900 PWR pin to power on/reset...");
+  pinMode(SIM900_PWR_PIN, OUTPUT);
+  digitalWrite(SIM900_PWR_PIN, LOW);
+  delay(1200); // 1–2 seconds is typical
+  digitalWrite(SIM900_PWR_PIN, HIGH);
+  delay(6000); // Wait for module to boot
+  digitalWrite(SIM900_PWR_PIN, LOW);
+  delay(3000);
+  //Serial.println("END OF SIM900 PWR pin to power on/reset...");
+  
+}
+
+void initializeGSM() {
+
+  String text = "GSM Initialization";
+  
+
+  Serial.println("GSM initialization complete");
+
+
+//bool sendSMS(String number, String text, String caller) {
+  //void clearbuffer();
+  delay (5000);
+  //Serial.println("Inside Send SMS--------------------> ");
+
+  //Serial.print("Modem Info: ");
+  //Serial.println(modem.getModemInfo());
+  // Check signal quality
+  void clearbuffer();
+  delay(1000);
+ // int signalQuality = modem.getSignalQuality();
+  //Serial.print("Signal quality: ");
+  //Serial.println(signalQuality);
+
+
+  modem.sendSMS(phoneNumber, text);
+
+  delay (5000);
+ // Serial.print("SMS Sent by : ");
+  //Serial.println(caller);
+
+  Serial.println("<-------------------- Exiting Send SMS ");
+}
+
+bool testATCommands() {
+  Serial.println("Testing SIM900 AT command response...");
+  if (modem.testAT()) {
+    Serial.println("SIM900 responded to AT commands.");
+    return true;
+  } else {
+    Serial.println("SIM900 did NOT respond to AT commands!");
+    return false;
+  }
+}
+
+void systemstart(){
+  
+  modem.sendSMS(phoneNumber, "System is initiated");
+  delay(2000);
+  modem.sendSMS(phoneNumber1, "System is initiated");
+
+   //sendSMS(phoneNumber, "System is initiated", "initialization");
+}
+
+void heartbeat(){
+  unsigned long currentMillis = millis();
+  Serial.println("calling heart beat");
+  String Message;
+   int vesdaRawValue = analogRead(PANEL_SENSOR_PIN); // 700 test value
+   float primaryVoltage = (vesdaRawValue / 1023.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR * CALIBRATION_FACTOR;
+   int rawValue = analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  float currentVoltage = (rawValue / 1023.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR * CALIBRATION_FACTOR;
+
+    int signalQuality = modem.getSignalQuality();
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+  
+
+  if (currentMillis - lastHeartbeatTime >= HEARTBEAT_INTERVAL_MS) {
+    Message +=  String(TRAIN_NUMBER)+"\n";
+    Message +=  String(COACH_NUMBER)+"\n";
+    Message += "MAIN: " + String(isMainsVoltagePresent ? "ON\n" : "OFF\n");
+    Message += "PB:" + String(primaryVoltage,2) +"V\n";
+    Message += "BB:" + String(currentVoltage,2) +"V\n";
+    Message += "SS:" + String(signalQuality) +"\n";
+
+    Serial.println("heart beat should be sent out"); 
+    modem.sendSMS(phoneNumber , Message);
+    delay(2000);
+    modem.sendSMS(phoneNumber1 , Message);
+
+    //sendSMS(phoneNumber, Message, "hearbeat");
+    lastHeartbeatTime = currentMillis;
+  }
+}
+
+bool checkNetwork() {
+  Serial.println("Checking network connectivity...");
+  if (modem.isNetworkConnected()) {
+      Serial.println("Network is connected.");
+      return true;
+  } else {
+      Serial.println("Network is NOT connected.");
+      return false;
+  }
+}
+
+void checkMaintenanceMode() {
+  static int lastStableState = HIGH;  // Assuming HIGH is normal mode (pull-up)
+  static unsigned long lastDebounceTime = 0;
+  int currentState = digitalRead(MAINTENANCE_SWITCH_PIN);
+
+  // Debounce logic
+  if (currentState != lastStableState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    // Only proceed if state actually changed
+    if (currentState != isInMaintenanceMode) {
+      isInMaintenanceMode = (currentState == LOW);  // Assuming LOW activates maintenance
+      
+      if (isInMaintenanceMode) {
+        modem.sendSMS(phoneNumber, "Maintenance Mode ACTIVATED - Alerts disabled");
+        delay(2000);
+        modem.sendSMS(phoneNumber1, "Maintenance Mode ACTIVATED - Alerts disabled");
+        Serial.println("Maintenance Mode ACTIVATED");
+        isInMaintenanceMode=false;
+      } else {
+        modem.sendSMS(phoneNumber, "Maintenance Mode DEACTIVATED - Alerts enabled");
+        delay(2000);
+        modem.sendSMS(phoneNumber1, "Maintenance Mode DEACTIVATED - Alerts enabled");
+        Serial.println("Maintenance Mode DEACTIVATED");
+        isInMaintenanceMode=true;
+      }
+    }
+  }
+
+  lastStableState = currentState;
+}
+
+void panelvoltage24() {
+  int vesdaRawValue = analogRead(PANEL_SENSOR_PIN);
+  float currentVoltage = (vesdaRawValue / 1023.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR * CALIBRATION_FACTOR;
+
+  // --- Logic 1: Check for threshold crossings ---
+  for (int i = 0; i < sizeof(ALERT_VOLTAGES) / sizeof(ALERT_VOLTAGES[0]); i++) {
+    float threshold = ALERT_VOLTAGES[i];
+
+    // Detect crossing downward (e.g., 22.2V → 21.8V crosses 22.0V)
+    if (lastVoltage >= threshold && currentVoltage < threshold && !wasAlertSent[i]) {
+      String message = "PP bat low (" + String( currentVoltage ) + "V)";
+      modem.sendSMS(phoneNumber, message);
+      delay(2000);
+      modem.sendSMS(phoneNumber1, message);
+      wasAlertSent[i] = true;  // Mark this threshold as alerted
+    }
+
+    // Reset alert flag if voltage recovers above threshold
+    if (currentVoltage > threshold) {
+      wasAlertSent[i] = false;
+    }
+  }
+
+  // --- Logic 2: Relay switching at 18.0V (unchanged) ---
+  if (currentVoltage <= 18.0 && !wasRelayTriggered) {
+    digitalWrite(RELAY_PIN, LOW);
+    wasRelayTriggered = true;
+    String message = "PP Bat (" + String( currentVoltage ) + "V)";
+    message += "Switched to BB bat.";
+      
+    modem.sendSMS(phoneNumber, message);
+    delay(2000);
+     modem.sendSMS(phoneNumber1, message);
+  } 
+  else if (currentVoltage > 19.0 && wasRelayTriggered) {
+    digitalWrite(RELAY_PIN, HIGH);
+    wasRelayTriggered = false;
+  }
+
+  lastVoltage = currentVoltage;  // Update for next loop
+}
+
+void backupvoltage24() {
+  int rawValue = analogRead(BACKUP_BATTERY_SENSOR_PIN);
+  float currentVoltage = (rawValue / 1023.0) * REFERENCE_VOLTAGE * VOLTAGE_SCALE_FACTOR * CALIBRATION_FACTOR;
+
+  // ===== EXACT VOLTAGE ALERTS (22.0V, 21.0V, 20.0V, 19.0V) =====
+  for (int i = 0; i < sizeof(BACKUP_ALERT_VOLTAGES)/sizeof(BACKUP_ALERT_VOLTAGES[0]); i++) {
+    float alertVoltage = BACKUP_ALERT_VOLTAGES[i];
+    
+    // Detect exact voltage matches
+    if (currentVoltage == alertVoltage && !backupAlertsSent[i]) {
+      String message = "Backup Battery AT " + String(alertVoltage, 1) + "V";
+      modem.sendSMS(phoneNumber, message);
+     delay(2000);
+      modem.sendSMS(phoneNumber1, message);
+      backupAlertsSent[i] = true;
+    }
+    
+    // Reset alert if voltage recovers above threshold
+    if (currentVoltage > alertVoltage) {
+      backupAlertsSent[i] = false;
+    }
+  }
+
+  // ===== CRITICAL 18V ALERT (ONE-TIME) =====
+  if (currentVoltage <= BACKUP_CRITICAL_VOLTAGE && !wasCriticalSent) {
+      String message = "BB bat low (" + String(currentVoltage) + "V )";
+      message += "Take Action!";
+
+    modem.sendSMS(phoneNumber, message);
+    delay(2000);
+    modem.sendSMS(phoneNumber1, message);
+    wasCriticalSent = true;
+  }
+  else if (currentVoltage > 19.0) {
+    wasCriticalSent = false; // Reset for future alerts
+  }
+
+  lastBackupVoltage = currentVoltage;
+}
+
+void voltage110(){
+
+  int mainsVoltageDigitalValue = digitalRead(MAINS_VOLTAGE_SENSOR_PIN); // LOW test value
+  
+  isMainsVoltagePresent = (mainsVoltageDigitalValue == LOW);
+  
+  if (!isMainsVoltagePresent && wasMainsVoltagePresent) {
+  Serial.print(" | Mains Status: "); Serial.println(isMainsVoltagePresent ? "Present" : "Absent");
+  String message = "110V Absent, Check Mains";
+  //sendSMS(phoneNumber, message, "110V");
+   modem.sendSMS(phoneNumber, message);
+   delay(2000);
+    modem.sendSMS(phoneNumber1, message);
+
+  }
+  wasMainsVoltagePresent = isMainsVoltagePresent;
+}
+
+void clearbuffer(){
+  while(sim900Serial.available()){
+    sim900Serial.read();
+  }
+
+}
+
+void clearSerialBuffer() {
+  while(Serial.available() > 0) {
+    Serial.read(); // Read and discard all available bytes
+  }
+}
+
+
+//final code.....heartbeat alone turned on for today nyt checking
