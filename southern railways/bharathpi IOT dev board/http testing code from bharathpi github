@@ -1,0 +1,207 @@
+
+
+
+/*************************************************************************
+   PROJECT: Bharat Pi 4G Board HTTP POST Example
+   AUTHOR: Bharat Pi
+   CREATED DATE: 04/09/2023
+   COPYRIGHT: BharatPi @MIT license for usage on Bharat Pi boards
+   version: 0.1.0
+ 
+   FUNC: 4G HTTP POST request to a URL
+   SIMCARD: 4G sim cards from Airtel/Vodaphone/Jio/BSNL can be used.
+   
+   IMPORTANT: Configure the APN accordingly as per your Sim provider
+   TODO: (Before you upload the code to Bharat Pi board) 
+   1) Change APN as per your Sim provider
+   2) Setup your HTTP endpoint URL
+   3) Use a power adapter 9V 2amps as the 4G module requires enough power
+   
+   DESC: This script will connect using 4G sim and make a HTTP POST request 
+   to a specified URL with JSON payload.
+ *************************************************************************/
+
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+
+#define SerialAT Serial1
+#define SerialMon Serial
+
+#define GSM_PIN "" // SIM card PIN if any
+
+// Set APN as per your sim card:
+const char apn[]  = "www"; // "airtelgprs.com", "bsnlnet", "portalnmms"
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+// Your API endpoint URL
+String api_url = "https://bharatrails.vercel.app/proins";
+
+#include <TinyGsmClient.h>
+#include <ArduinoJson.h>
+
+StaticJsonDocument<200> payloadObj;
+TinyGsm modem(SerialAT);
+
+#define PIN_DTR     25
+#define PIN_TX      17
+#define PIN_RX      16
+#define PWR_PIN     26
+
+void modemPowerOn(){
+  pinMode(PWR_PIN, OUTPUT);
+  digitalWrite(PWR_PIN, LOW);
+  delay(1000);
+  digitalWrite(PWR_PIN, HIGH);
+}
+
+void readHTTPResponse() {
+  Serial.println("Reading HTTP response...");
+  
+  // Get HTTP status
+  modem.sendAT("+HTTPSTATUS?");
+  String response = "";
+  if (modem.waitResponse(5000L, response) == 1) {
+    Serial.print("HTTP Status: ");
+    Serial.println(response);
+  }
+
+  // Get HTTP response data
+  modem.sendAT("+HTTPREAD");
+  response = "";
+  if (modem.waitResponse(5000L, response) == 1) {
+    Serial.print("HTTP Response: ");
+    Serial.println(response);
+  }
+}
+
+void setup(){
+  SerialMon.begin(115200);
+  delay(5000);
+
+  modemPowerOn();
+  SerialAT.begin(115200, SERIAL_8N1, PIN_RX, PIN_TX);
+  
+  Serial.println();
+  Serial.println("Bharat Pi 4G HTTP POST Example");
+  Serial.println("Initializing Modem...");
+
+  if (!modem.init()) {
+    Serial.println("Failed to initialize modem");
+    return;
+  }
+
+  // Unlock SIM card if needed
+  if (GSM_PIN && modem.getSimStatus() != 3) {
+    modem.simUnlock(GSM_PIN);
+  }
+
+  Serial.println("Connecting to network...");
+  
+  // Try different network modes
+  uint8_t networkModes[] = {2, 13, 38, 51}; // Automatic, GSM only, LTE only, GSM+LTE
+  bool isConnected = false;
+  
+  for (int i = 0; i < 4; i++) {
+    Serial.printf("Trying network mode %d\n", networkModes[i]);
+    modem.setNetworkMode(networkModes[i]);
+    delay(3000);
+    
+    int tryCount = 30;
+    while (tryCount--) {
+      if (modem.isNetworkConnected()) {
+        isConnected = true;
+        break;
+      }
+      delay(1000);
+    }
+    if (isConnected) break;
+  }
+
+  if (!isConnected) {
+    Serial.println("Failed to connect to network");
+    return;
+  }
+
+  Serial.println("Network connected successfully");
+  
+  // Prepare JSON payload
+  payloadObj["coachid"] = "b9-34567";
+  payloadObj["pribat"] = 1;
+  payloadObj["backbat"] = 20;
+  payloadObj["pripow"] = false;
+  payloadObj["maintainance"] = true;
+  payloadObj["lat"] = "8.99";
+  payloadObj["lng"] = "28.88";
+  payloadObj["sig"] = 20;
+  
+  String payload;
+  serializeJson(payloadObj, payload);
+
+  Serial.println("Making HTTP POST request...");
+  
+  // Initialize HTTP
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("HTTP init failed");
+    return;
+  }
+
+  // Set URL
+  modem.sendAT("+HTTPPARA=\"URL\"," + api_url);
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("URL setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  // Set content type to JSON
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Content type setting failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  // Prepare to send data
+  modem.sendAT("+HTTPDATA=" + String(payload.length()) + ",10000");
+  while (modem.waitResponse(1000UL, "DOWNLOAD") != 1) {
+    Serial.print(".");
+  }
+
+  // Send payload
+  modem.streamWrite(payload.c_str());
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("Data sending failed");
+    modem.sendAT("+HTTPTERM");
+    return;
+  }
+
+  // Execute POST request
+  modem.sendAT("+HTTPACTION=1");
+  if (modem.waitResponse(10000L) != 1) {
+    Serial.println("POST action failed");
+  } else {
+    Serial.println("POST request sent successfully");
+    Serial.print("Payload: ");
+    Serial.println(payload);
+    
+    // Wait a moment for the response to be available
+    delay(3000);
+    
+    // Read and print the HTTP response
+    readHTTPResponse();
+  }
+
+  // Terminate HTTP
+  delay(2000);
+  modem.sendAT("+HTTPTERM");
+  modem.waitResponse(5000L);
+  
+  Serial.println("HTTP POST example completed");
+}
+
+void loop(){
+  // Empty - runs only once
+  delay(1000);
+}v
